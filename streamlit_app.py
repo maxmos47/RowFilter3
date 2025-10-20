@@ -11,7 +11,7 @@ st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="cen
 # =========================
 # CONFIG: Google Sheets
 # =========================
-SPREADSHEET_ID = st.secrets.get("gsheets", {}).get("spreadsheet_id", "")
+SPREADSHEET_ID = (st.secrets.get("gsheets", {}).get("spreadsheet_id", "") or "").strip()
 WORKSHEET_NAME = st.secrets.get("gsheets", {}).get("worksheet_name", "Secondary")
 
 SCOPES = [
@@ -23,9 +23,19 @@ def get_gs_client():
     if "gcp_service_account" not in st.secrets:
         st.error("Missing [gcp_service_account] in secrets.toml")
         st.stop()
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
+    info = dict(st.secrets["gcp_service_account"])
+    # normalize private_key if user pasted with literal \n
+    pk = info.get("private_key", "")
+    if pk and ("\\n" in pk) and ("\n" not in pk):
+        info["private_key"] = pk.replace("\\n", "\n")
+    if "BEGIN PRIVATE KEY" not in info.get("private_key", ""):
+        st.error("Invalid private_key format in secrets.toml")
+        st.stop()
+    try:
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    except Exception as e:
+        st.error(f"Failed to build credentials: {e}")
+        st.stop()
     return gspread.authorize(creds)
 
 def open_ws():
@@ -33,11 +43,15 @@ def open_ws():
         st.error("Missing [gsheets].spreadsheet_id in secrets.toml")
         st.stop()
     gc = get_gs_client()
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        st.error("เปิดสเปรดชีตไม่สำเร็จ (ตรวจสิทธิ์/Spreadsheet ID):\n" + str(e))
+        st.stop()
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
-    except gspread.WorksheetNotFound:
-        st.error(f"Worksheet '{WORKSHEET_NAME}' not found.")
+    except Exception as e:
+        st.error(f"หา worksheet ชื่อ '{WORKSHEET_NAME}' ไม่เจอ: {e}")
         st.stop()
     return ws
 
@@ -147,8 +161,13 @@ def update_LQ(ws, row: int, lq_values: Dict[str, str]) -> Dict:
     for h, v in lq_values.items():
         if h in headers:
             col_idx = headers.index(h) + 1  # 1-based
-            a1 = f"{index_to_col_letter(col_idx)}{row}"
-            updates.append({"range": a1, "values": [[v]]})
+            a1_core = f"{index_to_col_letter(col_idx)}{row}"
+            a1 = f"{ws.title}!{a1_core}"  # include sheet name to target correct tab
+            updates.append({
+                "range": a1,
+                "majorDimension": "ROWS",
+                "values": [[v]],
+            })
     if updates:
         ws.spreadsheet.values_batch_update(
             body={
@@ -231,6 +250,14 @@ try:
         row = 1
 except ValueError:
     row = 1
+
+# Row picker (to avoid always defaulting to row 1)
+with st.form("row_picker", border=False):
+    row_input = st.number_input("Row number", min_value=1, value=row, step=1)
+    go = st.form_submit_button("Go to row")
+if go and row_input != row:
+    set_query_params(row=str(row_input), mode=mode)
+    st.rerun()
 
 ws = open_ws()
 has_inline_phase2 = st.session_state["next_after_lq"] is not None
