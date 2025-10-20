@@ -24,7 +24,6 @@ def get_gs_client():
         st.error("Missing [gcp_service_account] in secrets.toml")
         st.stop()
     info = dict(st.secrets["gcp_service_account"])
-    # normalize private_key if user pasted with literal \n
     pk = info.get("private_key", "")
     if pk and ("\\n" in pk) and ("\n" not in pk):
         info["private_key"] = pk.replace("\\n", "\n")
@@ -105,7 +104,6 @@ def get_header_and_row(ws, row: int) -> Tuple[List[str], List[str]]:
     """Return (headers, values) where headers are row 1 and values are row N."""
     headers = ws.row_values(1)
     vals = ws.row_values(row)
-    # pad vals to len(headers)
     if len(vals) < len(headers):
         vals = vals + [""] * (len(headers) - len(vals))
     return headers, vals
@@ -119,26 +117,18 @@ def slice_dict_by_cols(headers: List[str], vals: List[str], start_col: str, end_
             out[headers[i]] = vals[i] if i < len(vals) else ""
     return out
 
-def build_payloads_from_row(ws, row: int, mode: str) -> Dict:
-    headers, vals = get_header_and_row(ws, row)
+def build_payloads_from_row(ws, sheet_row: int, mode: str) -> Dict:
+    headers, vals = get_header_and_row(ws, sheet_row)
 
-    # A–K
     AK = slice_dict_by_cols(headers, vals, "A", "K")
-    # L–Q (6 flags)
     LQ_dict = slice_dict_by_cols(headers, vals, "L", "Q")
     headers_LQ = list(LQ_dict.keys())
     current_LQ = [LQ_dict[h] if LQ_dict[h] in YN else ("Yes" if str(LQ_dict[h]).strip().lower() == "yes" else "No") for h in headers_LQ]
-
-    # R–U (post phase-1 view)
     RU = slice_dict_by_cols(headers, vals, "R", "U")
-    # V (priority)
     Vcol_idx = col_letter_to_index("V") - 1
     current_V = vals[Vcol_idx] if Vcol_idx < len(vals) else ""
-
-    # A–C + R–U (for edit2)
     AC = slice_dict_by_cols(headers, vals, "A", "C")
     A_C_R_U = {**AC, **RU}
-    # A–C + R–V (for final)
     RV = slice_dict_by_cols(headers, vals, "R", "V")
     A_C_R_V = {**AC, **RV}
 
@@ -154,38 +144,24 @@ def build_payloads_from_row(ws, row: int, mode: str) -> Dict:
         data["A_C_R_V"] = A_C_R_V
     return data
 
-def update_LQ(ws, row: int, lq_values: Dict[str, str]) -> Dict:
-    # Find header row, map header -> col
+def update_LQ(ws, sheet_row: int, lq_values: Dict[str, str]) -> Dict:
     headers = ws.row_values(1)
     updates = []
     for h, v in lq_values.items():
         if h in headers:
             col_idx = headers.index(h) + 1  # 1-based
-            a1_core = f"{index_to_col_letter(col_idx)}{row}"
-            a1 = f"{ws.title}!{a1_core}"  # include sheet name to target correct tab
-            updates.append({
-                "range": a1,
-                "majorDimension": "ROWS",
-                "values": [[v]],
-            })
+            a1 = f"{ws.title}!{index_to_col_letter(col_idx)}{sheet_row}"
+            updates.append({"range": a1, "majorDimension": "ROWS", "values": [[v]]})
     if updates:
-        ws.spreadsheet.values_batch_update(
-            body={
-                "valueInputOption": "RAW",
-                "data": updates
-            }
-        )
-    # Build "next" payload (same row after update)
-    data_next = build_payloads_from_row(ws, row, mode="edit2")
+        ws.spreadsheet.values_batch_update(body={"valueInputOption": "RAW", "data": updates})
+    data_next = build_payloads_from_row(ws, sheet_row, mode="edit2")
     return {"status": "ok", "next": data_next}
 
-def update_V(ws, row: int, v_value: str) -> Dict:
-    # column V
+def update_V(ws, sheet_row: int, v_value: str) -> Dict:
     V_idx = col_letter_to_index("V")
-    a1 = f"{index_to_col_letter(V_idx)}{row}"
+    a1 = f"{index_to_col_letter(V_idx)}{sheet_row}"
     ws.update_acell(a1, v_value)
-    # Build final payload
-    headers, vals = get_header_and_row(ws, row)
+    headers, vals = get_header_and_row(ws, sheet_row)
     AC = slice_dict_by_cols(headers, vals, "A", "C")
     RV = slice_dict_by_cols(headers, vals, "R", "V")
     return {"status": "ok", "final": {"A_C_R_V": {**AC, **RV}}}
@@ -241,23 +217,18 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
 st.markdown("### 🩺 Patient Information")
 
 qp = get_query_params()
-row_str = qp.get("row", "1")
+display_row_str = qp.get("row", "1")
 mode = qp.get("mode", "edit1")  # edit1 -> L–Q; edit2 -> V; view -> final
 
+# Interpret URL row=1 as sheet row 2 (headers at row 1)
 try:
-    row = int(row_str)
-    if row < 1:
-        row = 1
+    display_row = int(display_row_str)
+    if display_row < 1:
+        display_row = 1
 except ValueError:
-    row = 1
+    display_row = 1
 
-# Row picker (to avoid always defaulting to row 1)
-with st.form("row_picker", border=False):
-    row_input = st.number_input("Row number", min_value=1, value=row, step=1)
-    go = st.form_submit_button("Go to row")
-if go and row_input != row:
-    set_query_params(row=str(row_input), mode=mode)
-    st.rerun()
+sheet_row = display_row + 1  # shift by 1 so that "row=1" targets sheet row 2
 
 ws = open_ws()
 has_inline_phase2 = st.session_state["next_after_lq"] is not None
@@ -265,7 +236,7 @@ has_inline_phase2 = st.session_state["next_after_lq"] is not None
 # Prepare dataframes by mode
 if mode == "edit1" and not has_inline_phase2:
     try:
-        data = build_payloads_from_row(ws, row=row, mode="edit1")
+        data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit1")
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
@@ -274,7 +245,7 @@ if mode == "edit1" and not has_inline_phase2:
     current_LQ = data.get("current_LQ", [])
 elif mode == "edit2" and not has_inline_phase2:
     try:
-        data = build_payloads_from_row(ws, row=row, mode="edit2")
+        data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="edit2")
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
@@ -282,7 +253,7 @@ elif mode == "edit2" and not has_inline_phase2:
     current_V = data.get("current_V", "")
 elif mode == "view":
     try:
-        data = build_payloads_from_row(ws, row=row, mode="view")
+        data = build_payloads_from_row(ws, sheet_row=sheet_row, mode="view")
     except Exception as e:
         st.error(f"Failed to read sheet: {e}")
         st.stop()
@@ -294,7 +265,7 @@ if mode == "view":
     st.success("Triage completed")
     if st.button("Triage again"):
         st.session_state["next_after_lq"] = None
-        set_query_params(row=str(row), mode="edit1")
+        set_query_params(row=str(display_row), mode="edit1")
         st.rerun()
 
 elif mode == "edit2" and not has_inline_phase2:
@@ -306,13 +277,13 @@ elif mode == "edit2" and not has_inline_phase2:
         submitted = st.form_submit_button("Submit")
     if submitted:
         try:
-            res = update_V(ws, row=row, v_value=v_value)
+            res = update_V(ws, sheet_row=sheet_row, v_value=v_value)
             if res.get("status") == "ok":
                 final = res.get("final", {})
                 df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                 render_kv_grid(df_final, title="Patient", cols=2)
                 st.success("Saved. Final view (no form).")
-                set_query_params(row=str(row), mode="view")
+                set_query_params(row=str(display_row), mode="view")
             else:
                 st.error(f"Update V failed: {res}")
         except Exception as e:
@@ -343,7 +314,7 @@ else:
 
         if submitted:
             try:
-                res = update_LQ(ws, row=row, lq_values=selections)
+                res = update_LQ(ws, sheet_row=sheet_row, lq_values=selections)
                 if res.get("status") == "ok":
                     st.session_state["next_after_lq"] = res.get("next", {})
                 else:
@@ -366,14 +337,14 @@ else:
 
         if v_submitted:
             try:
-                res2 = update_V(ws, row=row, v_value=v_value)
+                res2 = update_V(ws, sheet_row=sheet_row, v_value=v_value)
                 if res2.get("status") == "ok":
                     final = res2.get("final", {})
                     df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                     render_kv_grid(df_final, title="Patient", cols=2)
                     st.success("Triage เรียบร้อย")
                     st.session_state["next_after_lq"] = None
-                    set_query_params(row=str(row), mode="view")
+                    set_query_params(row=str(display_row), mode="view")
                 else:
                     st.error(f"Update V failed: {res2}")
             except Exception as e:
