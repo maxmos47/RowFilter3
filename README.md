@@ -1,31 +1,33 @@
+# Patient Dashboard (Google Sheets - Secondary)
 
-# Patient Dashboard — FAST (GAS + Streamlit)
+ดึง/เขียนข้อมูลจาก Google Sheet โดยตรง (ชีต: **Secondary**). โฟลว์:
+1) โหมด `edit1` : แสดง A–K + ฟอร์มเช็คบ็อกซ์ L–Q (Yes/No)
+2) โหมด `edit2` : แสดง A–C + R–U และเลือก Priority (V)
+3) โหมด `view`  : แสดง A–C + R–V
 
-## What you get
-- **GAS (Code.gs)**: mode-aware (`edit1|edit2|view`), returns `next/final` on POST, header cache 120s
-- **Streamlit app**: no nested forms, renders next step inline after submit, GET caching (ttl=10s)
+## การตั้งค่า
 
-## Deploy GAS
-1. Go to https://script.google.com/ → New project
-2. Paste `Code.gs`
-3. Set `SHEET_ID` (already set to your sheet ID in this template)
-4. (Optional) set `TOKEN` and pass it from Streamlit
-5. Deploy → Web app → Execute as: **Me**; Who has access: **Anyone with the link** (or your domain)
+1. สร้าง Service Account ใน Google Cloud และดาวน์โหลดไฟล์ JSON
+2. แชร์สเปรดชีตให้ service account (สิทธิ์ Editor)
+3. ตั้งค่า `.streamlit/secrets.toml`
 
-## Streamlit secrets
+ตัวอย่าง:
 ```
-[gas]
-webapp_url = "https://script.google.com/macros/s/AKfycbYOUR_WEBAPP_ID/exec"
-# token = "MY_SHARED_SECRET"
+[gcp_service_account]
+# คัดลอกค่าจากไฟล์ JSON ของ Service Account
+
+[gsheets]
+spreadsheet_id = "1oaQZ6OwxJUti4AIf620Hp_bCjmKwu8AF9jYTv4vs7Hc"
+worksheet_name = "Secondary"
 ```
 
-## Run
+## รันแอป
 ```
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
-## URL usage
-- Start: `?row=1&mode=edit1` → A–K + L–Q (Yes/No)
-- Submit L–Q → inline A–C, R–U + V (Priority 1/2/3)
-- Submit V → final A–C, R–V (no form)
+## การเปิดด้วย query params
+- `?row=1&mode=edit1` (ค่าเริ่มต้น)
+- `?row=1&mode=edit2`
+- `?row=1&mode=view`
