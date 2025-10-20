@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Patient Dashboard (fast + fixed)", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
 # =========================
 # CONFIG (.streamlit/secrets.toml)
@@ -130,7 +130,7 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
 # =========================
 # Main UI
 # =========================
-st.markdown("### 🩺 Patient Information (Fast Submit + No Nested Forms)")
+st.markdown("### 🩺 Patient Information")
 
 if not GAS_WEBAPP_URL:
     st.error("Missing GAS web app URL. Add to secrets:\\n\\n[gas]\\nwebapp_url = \"https://script.google.com/macros/s/XXX/exec\"")
@@ -258,28 +258,10 @@ else:
                     final = res2.get("final", {})
                     df_final = pd.DataFrame([final.get("A_C_R_V", {})])
                     render_kv_grid(df_final, title="Patient", cols=2)
-                    st.success("Saved. Final view (no form).")
+                    st.success("Triage เรียบร้อย")
                     st.session_state["next_after_lq"] = None
                     set_query_params(row=str(row), mode="view")
                 else:
                     st.error(f"Update V failed: {res2}")
             except Exception as e:
                 st.error(f"Failed to update V via GAS: {e}")
-
-# Quick row navigation
-with st.expander("Quick row navigation", expanded=False):
-    col1, col2 = st.columns(2)
-    with col1:
-        new_row = st.number_input("Go to row (1-based, data row under header)", min_value=1, value=row, step=1)
-    with col2:
-        if st.button("Go"):
-            st.session_state["next_after_lq"] = None
-            set_query_params(row=str(new_row), mode="edit1")
-            st.rerun()
-
-st.markdown("""
-<small>
-<b>URL:</b> <code>?row=1</code> (1 = first data row) •
-<code>&mode=edit1</code> A–K + L–Q → submit → inline V → final (no extra GET/rerun)
-</small>
-""", unsafe_allow_html=True)
