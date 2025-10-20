@@ -1,26 +1,50 @@
-
 import json
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
-import requests
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Patient Dashboard", page_icon="🩺", layout="centered")
 
 # =========================
-# CONFIG (.streamlit/secrets.toml)
+# CONFIG: Google Sheets
 # =========================
-# [gas]
-# webapp_url = "https://script.google.com/macros/s/AKfycb.../exec"
-# token = "MY_SHARED_SECRET"     # (optional, only if you set TOKEN in GAS)
-GAS_WEBAPP_URL = st.secrets.get("gas", {}).get("webapp_url", "")
-TOKEN = st.secrets.get("gas", {}).get("token", "")  # optional shared secret
+SPREADSHEET_ID = st.secrets.get("gsheets", {}).get("spreadsheet_id", "")
+WORKSHEET_NAME = st.secrets.get("gsheets", {}).get("worksheet_name", "Secondary")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def get_gs_client():
+    if "gcp_service_account" not in st.secrets:
+        st.error("Missing [gcp_service_account] in secrets.toml")
+        st.stop()
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
+def open_ws():
+    if not SPREADSHEET_ID:
+        st.error("Missing [gsheets].spreadsheet_id in secrets.toml")
+        st.stop()
+    gc = get_gs_client()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws = sh.worksheet(WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        st.error(f"Worksheet '{WORKSHEET_NAME}' not found.")
+        st.stop()
+    return ws
 
 ALLOWED_V = ["Priority 1", "Priority 2", "Priority 3"]
 YN = ["Yes", "No"]
 
-# Keep phase-2 payload after L–Q submit (avoid nested forms + extra GET)
+# Keep phase-2 payload after L–Q submit (avoid extra reload)
 if "next_after_lq" not in st.session_state:
     st.session_state["next_after_lq"] = None
 
@@ -42,45 +66,110 @@ def set_query_params(**kwargs):
         st.experimental_set_query_params(**kwargs)
 
 # =========================
-# HTTP helpers
+# Utility: column helpers
 # =========================
-def _parse_json_or_show(r: requests.Response, context: str):
-    try:
-        return r.json()
-    except json.JSONDecodeError:
-        body = r.text[:800]
-        st.error(f"{context} returned non-JSON (status={r.status_code}, "
-                 f"content-type={r.headers.get('content-type')}). "
-                 f"Body preview:\\n\\n{body}")
-        raise
+def col_letter_to_index(letter: str) -> int:
+    """A -> 1, B -> 2, ..."""
+    letter = letter.upper()
+    result = 0
+    for ch in letter:
+        result = result * 26 + (ord(ch) - ord('A') + 1)
+    return result
 
-@st.cache_data(ttl=10, show_spinner=False)
-def cached_get_row(url: str, row: int, mode: str, token: str|None=None) -> dict:
-    params = {"action": "get", "row": str(row), "mode": mode}
-    if token:
-        params["token"] = token
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return _parse_json_or_show(r, "GET /exec")
+def index_to_col_letter(idx: int) -> str:
+    """1 -> A, 2 -> B, ..."""
+    letters = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
 
-def gas_get_row(row: int, mode: str) -> dict:
-    return cached_get_row(GAS_WEBAPP_URL, row, mode, TOKEN if TOKEN else None)
+# =========================
+# Sheets data access layer
+# =========================
+def get_header_and_row(ws, row: int) -> Tuple[List[str], List[str]]:
+    """Return (headers, values) where headers are row 1 and values are row N."""
+    headers = ws.row_values(1)
+    vals = ws.row_values(row)
+    # pad vals to len(headers)
+    if len(vals) < len(headers):
+        vals = vals + [""] * (len(headers) - len(vals))
+    return headers, vals
 
-def gas_update_lq(row: int, lq_values: Dict[str, str]) -> dict:
-    payload = {"action": "update_lq", "row": str(row), "lq": pd.Series(lq_values).to_json()}
-    if TOKEN:
-        payload["token"] = TOKEN
-    r = requests.post(GAS_WEBAPP_URL, data=payload, timeout=25)
-    r.raise_for_status()
-    return _parse_json_or_show(r, "POST update_lq")
+def slice_dict_by_cols(headers: List[str], vals: List[str], start_col: str, end_col: str) -> Dict[str, str]:
+    s = col_letter_to_index(start_col) - 1  # 0-based
+    e = col_letter_to_index(end_col) - 1
+    out = {}
+    for i in range(s, e + 1):
+        if i < len(headers):
+            out[headers[i]] = vals[i] if i < len(vals) else ""
+    return out
 
-def gas_update_v(row: int, v_value: str) -> dict:
-    payload = {"action": "update_v", "row": str(row), "value": v_value}
-    if TOKEN:
-        payload["token"] = TOKEN
-    r = requests.post(GAS_WEBAPP_URL, data=payload, timeout=25)
-    r.raise_for_status()
-    return _parse_json_or_show(r, "POST update_v")
+def build_payloads_from_row(ws, row: int, mode: str) -> Dict:
+    headers, vals = get_header_and_row(ws, row)
+
+    # A–K
+    AK = slice_dict_by_cols(headers, vals, "A", "K")
+    # L–Q (6 flags)
+    LQ_dict = slice_dict_by_cols(headers, vals, "L", "Q")
+    headers_LQ = list(LQ_dict.keys())
+    current_LQ = [LQ_dict[h] if LQ_dict[h] in YN else ("Yes" if str(LQ_dict[h]).strip().lower() == "yes" else "No") for h in headers_LQ]
+
+    # R–U (post phase-1 view)
+    RU = slice_dict_by_cols(headers, vals, "R", "U")
+    # V (priority)
+    Vcol_idx = col_letter_to_index("V") - 1
+    current_V = vals[Vcol_idx] if Vcol_idx < len(vals) else ""
+
+    # A–C + R–U (for edit2)
+    AC = slice_dict_by_cols(headers, vals, "A", "C")
+    A_C_R_U = {**AC, **RU}
+    # A–C + R–V (for final)
+    RV = slice_dict_by_cols(headers, vals, "R", "V")
+    A_C_R_V = {**AC, **RV}
+
+    data = {"status": "ok"}
+    if mode == "edit1":
+        data["A_K"] = AK
+        data["headers_LQ"] = headers_LQ
+        data["current_LQ"] = current_LQ
+    elif mode == "edit2":
+        data["A_C_R_U"] = A_C_R_U
+        data["current_V"] = current_V
+    elif mode == "view":
+        data["A_C_R_V"] = A_C_R_V
+    return data
+
+def update_LQ(ws, row: int, lq_values: Dict[str, str]) -> Dict:
+    # Find header row, map header -> col
+    headers = ws.row_values(1)
+    updates = []
+    for h, v in lq_values.items():
+        if h in headers:
+            col_idx = headers.index(h) + 1  # 1-based
+            a1 = f"{index_to_col_letter(col_idx)}{row}"
+            updates.append({"range": a1, "values": [[v]]})
+    if updates:
+        ws.spreadsheet.values_batch_update(
+            body={
+                "valueInputOption": "RAW",
+                "data": updates
+            }
+        )
+    # Build "next" payload (same row after update)
+    data_next = build_payloads_from_row(ws, row, mode="edit2")
+    return {"status": "ok", "next": data_next}
+
+def update_V(ws, row: int, v_value: str) -> Dict:
+    # column V
+    V_idx = col_letter_to_index("V")
+    a1 = f"{index_to_col_letter(V_idx)}{row}"
+    ws.update_acell(a1, v_value)
+    # Build final payload
+    headers, vals = get_header_and_row(ws, row)
+    AC = slice_dict_by_cols(headers, vals, "A", "C")
+    RV = slice_dict_by_cols(headers, vals, "R", "V")
+    return {"status": "ok", "final": {"A_C_R_V": {**AC, **RV}}}
 
 # =========================
 # Card UI (mobile-friendly)
@@ -132,10 +221,6 @@ def render_kv_grid(df_one_row: pd.DataFrame, title: str = "", cols: int = 2):
 # =========================
 st.markdown("### 🩺 Patient Information")
 
-if not GAS_WEBAPP_URL:
-    st.error("Missing GAS web app URL. Add to secrets:\\n\\n[gas]\\nwebapp_url = \"https://script.google.com/macros/s/XXX/exec\"")
-    st.stop()
-
 qp = get_query_params()
 row_str = qp.get("row", "1")
 mode = qp.get("mode", "edit1")  # edit1 -> L–Q; edit2 -> V; view -> final
@@ -147,31 +232,33 @@ try:
 except ValueError:
     row = 1
 
-# If user just submitted L–Q, we have "next" payload in session → no extra GET/rerun
+ws = open_ws()
 has_inline_phase2 = st.session_state["next_after_lq"] is not None
-
-# Initial GET only if no "next" payload
-if not has_inline_phase2:
-    try:
-        data = gas_get_row(row=row, mode=mode)
-    except Exception as e:
-        st.error(f"Failed to fetch row via GAS: {e}")
-        st.stop()
-    if data.get("status") != "ok":
-        st.error(f"GAS error: {data}")
-        st.stop()
-else:
-    data = {"status": "ok"}  # placeholder
 
 # Prepare dataframes by mode
 if mode == "edit1" and not has_inline_phase2:
+    try:
+        data = build_payloads_from_row(ws, row=row, mode="edit1")
+    except Exception as e:
+        st.error(f"Failed to read sheet: {e}")
+        st.stop()
     df_AK = pd.DataFrame([data.get("A_K", {})])
     headers_LQ = data.get("headers_LQ", ["L","M","N","O","P","Q"])
     current_LQ = data.get("current_LQ", [])
 elif mode == "edit2" and not has_inline_phase2:
+    try:
+        data = build_payloads_from_row(ws, row=row, mode="edit2")
+    except Exception as e:
+        st.error(f"Failed to read sheet: {e}")
+        st.stop()
     df_AC_RU = pd.DataFrame([data.get("A_C_R_U", {})])
     current_V = data.get("current_V", "")
 elif mode == "view":
+    try:
+        data = build_payloads_from_row(ws, row=row, mode="view")
+    except Exception as e:
+        st.error(f"Failed to read sheet: {e}")
+        st.stop()
     df_AC_RV = pd.DataFrame([data.get("A_C_R_V", {})])
 
 # ============ Modes ============
@@ -192,7 +279,7 @@ elif mode == "edit2" and not has_inline_phase2:
         submitted = st.form_submit_button("Submit")
     if submitted:
         try:
-            res = gas_update_v(row=row, v_value=v_value)
+            res = update_V(ws, row=row, v_value=v_value)
             if res.get("status") == "ok":
                 final = res.get("final", {})
                 df_final = pd.DataFrame([final.get("A_C_R_V", {})])
@@ -202,7 +289,7 @@ elif mode == "edit2" and not has_inline_phase2:
             else:
                 st.error(f"Update V failed: {res}")
         except Exception as e:
-            st.error(f"Failed to update V via GAS: {e}")
+            st.error(f"Failed to update V: {e}")
 
 else:
     # Phase 1: A–K + L–Q form
@@ -229,14 +316,13 @@ else:
 
         if submitted:
             try:
-                res = gas_update_lq(row=row, lq_values=selections)
+                res = update_LQ(ws, row=row, lq_values=selections)
                 if res.get("status") == "ok":
-                    # Render next phase inline (no GET, no rerun)
                     st.session_state["next_after_lq"] = res.get("next", {})
                 else:
                     st.error(f"Update L–Q failed: {res}")
             except Exception as e:
-                st.error(f"Failed to update L–Q via GAS: {e}")
+                st.error(f"Failed to update L–Q: {e}")
 
     # Inline phase 2 after L–Q submit
     nxt = st.session_state.get("next_after_lq")
@@ -253,7 +339,7 @@ else:
 
         if v_submitted:
             try:
-                res2 = gas_update_v(row=row, v_value=v_value)
+                res2 = update_V(ws, row=row, v_value=v_value)
                 if res2.get("status") == "ok":
                     final = res2.get("final", {})
                     df_final = pd.DataFrame([final.get("A_C_R_V", {})])
@@ -264,4 +350,4 @@ else:
                 else:
                     st.error(f"Update V failed: {res2}")
             except Exception as e:
-                st.error(f"Failed to update V via GAS: {e}")
+                st.error(f"Failed to update V: {e}")
